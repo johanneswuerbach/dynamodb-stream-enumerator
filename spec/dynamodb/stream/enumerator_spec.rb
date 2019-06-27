@@ -69,7 +69,7 @@ RSpec.describe Dynamodb::Stream::Enumerator do
       end
     end
 
-    sleep 5
+    sleep 10
 
     test_date = Time.now.iso8601
 
@@ -83,7 +83,7 @@ RSpec.describe Dynamodb::Stream::Enumerator do
 
     p "Item inserted, waiting"
 
-    sleep 5
+    sleep 10
 
     t.exit
 
