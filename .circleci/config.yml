@@ -7,6 +7,9 @@ jobs:
     steps:
       - checkout
       - run:
+          name: Install bundler
+          command: gem install bundler:2.0.2
+      - run:
           name: Bundle Install
           command: bundle check || bundle install
       - run:
