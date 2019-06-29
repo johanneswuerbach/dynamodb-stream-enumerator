@@ -2,29 +2,11 @@ require "aws-sdk-dynamodb"
 require "aws-sdk-dynamodbstreams"
 
 RSpec.describe Dynamodb::Stream::Enumerator do
-  it "has a version number" do
-    expect(Dynamodb::Stream::Enumerator::VERSION).not_to be nil
-  end
+  table_name = "dynamodb-stream-enumerator-test-#{Time.now.to_i}"
 
-  it "does something useful" do
-    client = Aws::DynamoDB::Client.new
-    streams_client = Aws::DynamoDBStreams::Client.new
-
-
-    table_name = "dynamodb-stream-enumerator-test-#{Time.now.to_i}"
-
-    begin
-      client.delete_table({
-        table_name: table_name,
-      })
-
-      client.wait_until(:table_not_exists, {
-        table_name: table_name,
-      })
-    rescue Aws::DynamoDB::Errors::ResourceNotFoundException => e
-    end
-
-    client.create_table({
+  before(:all) do
+    @client = Aws::DynamoDB::Client.new
+    @client.create_table({
       attribute_definitions: [{
         attribute_name: "Id",
         attribute_type: "S",
@@ -52,16 +34,32 @@ RSpec.describe Dynamodb::Stream::Enumerator do
       ],
     })
 
-    client.wait_until(:table_exists, {
+    @client.wait_until(:table_exists, {
       table_name: table_name,
     })
+  end
 
-    p "Table created"
+  after(:all) do
+    @client.delete_table({
+      table_name: table_name,
+    })
+  end
 
+  it "has a version number" do
+    expect(Dynamodb::Stream::Enumerator::VERSION).not_to be nil
+  end
+
+  it "does something useful" do
     found_records = []
 
+    resp = @client.describe_table({
+      table_name: table_name
+    })
+
+    enumerator_ready = false
+
     t = Thread.new do
-      records = Dynamodb::Stream::Enumerator.for_table(table_name)
+      records = Dynamodb::Stream::Enumerator.new(resp.table.latest_stream_arn, on_ready: ->{ enumerator_ready = true })
       p "Start enumerator"
       records.each do |record|
         p "R: #{record}"
@@ -69,11 +67,15 @@ RSpec.describe Dynamodb::Stream::Enumerator do
       end
     end
 
-    sleep 10
+    p "Waiting for enumerator"
+
+    until enumerator_ready do; end
+
+    p "Enumerator running"
 
     test_date = Time.now.iso8601
 
-    resp = client.put_item({
+    resp = @client.put_item({
       item: {
         "Id" => "test",
         "Date" => test_date,
@@ -83,7 +85,7 @@ RSpec.describe Dynamodb::Stream::Enumerator do
 
     p "Item inserted, waiting"
 
-    sleep 10
+    sleep 5
 
     t.exit
 
@@ -93,15 +95,5 @@ RSpec.describe Dynamodb::Stream::Enumerator do
     expect(record.event_name).to eq "INSERT"
     expect(record.dynamodb.new_image["Id"].s).to eq "test"
     expect(record.dynamodb.new_image["Date"].s).to eq test_date
-
-    p "Table deleting"
-
-    client.delete_table({
-      table_name: table_name,
-    })
-
-    # client.wait_until(:table_not_exists, {
-    #   table_name: table_name,
-    # })
   end
 end

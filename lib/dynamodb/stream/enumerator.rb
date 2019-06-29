@@ -1,4 +1,5 @@
 require "dynamodb/stream/enumerator/version"
+require "dynamodb/stream/enumerator/shard_reader"
 require "aws-sdk-dynamodbstreams"
 
 module Dynamodb
@@ -6,124 +7,130 @@ module Dynamodb
     class Enumerator < ::Enumerator
       class Error < StandardError; end
 
-      def initialize(stream_arn, client_or_options = {})
+      def initialize(stream_arn, client: nil, client_options: {}, record_batch_size: 1000, throttle_on_empty_records: 1, on_ready: ->{})
         @stream_arn = stream_arn
-        @client = self.class.create_client(client_or_options)
+        @client = client ? client : Aws::DynamoDBStreams::Client.new(client_options)
 
-        @throttle_on_empty_records = 1
-        @record_batch_size = 1000
-        @records = []
+        @throttle_on_empty_records = throttle_on_empty_records
+        @record_batch_size = record_batch_size
+        @shard_readers = fetch_current_open_shards.map do |shard|
+          shard_iterator = get_shard_iterator(shard, "LATEST")
+          [shard, ShardReader.new(@client, shard_iterator)]
+        end
+
+        on_ready.call
 
         super() do |yielder|
+          records = []
           loop do
-            while @records.empty? do
-              load_next_batch
+            while records.empty? do
+              records = load_next_batch
             end
 
-            yielder << @records.shift
+            yielder << records.shift
           end
         end
-      end
-
-      def self.for_table(table_name, client_or_options = {})
-        client = self.create_client(client_or_options)
-        resp = client.list_streams({
-          table_name: table_name,
-          limit: 1
-        })
-
-        raise "More then one stream found" if resp.last_evaluated_stream_arn
-        raise "No streams found" if resp.streams.empty?
-
-        self.new(resp.streams[0].stream_arn, client)
       end
 
       private
 
-      def self.create_client(client_or_options)
-        if client_or_options.is_a?(Aws::DynamoDBStreams::Client)
-          return client_or_options
-        end
-
-        Aws::DynamoDBStreams::Client.new(client_or_options)
-      end
-
+      # Load next batch of records
       def load_next_batch
-        unless @shard_iterator
-          get_next_shard
-          get_shard_iterator
+        next_shard_readers = []
+        records = []
+
+        until @shard_readers.empty?
+          shard, shard_reader = @shard_readers.shift
+
+          records = shard_reader.get_records(@record_batch_size)
+
+          if shard_reader.finished?
+            childs_shards = fetch_child_shards(shard)
+
+            next_shard_readers.concat childs_shards.map do |shard|
+              shard_iterator = get_shard_iterator(shard, "AT_SEQUENCE_NUMBER")
+              [shard, ShardReader.new(@client, shard_iterator)]
+            end
+          else
+            next_shard_readers << [shard, shard_reader]
+          end
+
+          break unless records.empty?
         end
 
-        load_records
+        # Throttle if no new records are available in all shards
+        sleep @throttle_on_empty_records if @shard_readers.empty?
 
-        # Throttle if no new records are available
-        sleep @throttle_on_empty_records if @records.empty?
+        @shard_readers.concat(next_shard_readers)
+
+        records
       end
 
-
-      def load_records
-        # https://docs.aws.amazon.com/sdk-for-ruby/v3/api/Aws/DynamoDBStreams/Client.html#get_records-instance_method
-        resp = @client.get_records({
-          shard_iterator: @shard_iterator,
-          limit: @record_batch_size
-        })
-
-        @shard_iterator = resp.next_shard_iterator
-        @records = resp.records
-      end
-
-      def get_next_shard
+      # Find all currently open shards
+      def fetch_current_open_shards
         last_evaluated_shard_id = nil
-        next_shard = nil
 
+        open_shards = []
+
+        each_shard do |shard|
+          # Shard without an ending sequence number contains the latest records
+          open_shards << shard unless shard.sequence_number_range.ending_sequence_number
+        end
+
+        open_shards
+      end
+
+      # Find child shards
+      def fetch_child_shards(shard)
+        last_evaluated_shard_id = nil
+
+        childs_shards = []
+
+        each_shard do |potential_child_shard|
+          childs_shards << potential_child_shard if potential_child_shard.parent_shard_id == shard.shard_id
+        end
+
+        childs_shards
+      end
+
+      # Iterate over all shards and yield each shard
+      def each_shard
+        # https://docs.aws.amazon.com/sdk-for-ruby/v3/api/Aws/DynamoDBStreams/Client.html#describe_stream-instance_method
+        last_evaluated_shard_id = nil
+        limit = 100
         loop do
-          # https://docs.aws.amazon.com/sdk-for-ruby/v3/api/Aws/DynamoDBStreams/Client.html#describe_stream-instance_method
           opts = {
             stream_arn: @stream_arn,
-            limit: 100
+            limit: limit
           }
-          opts[:exclusive_start_shard_id] = @last_evaluated_shard_id if @last_evaluated_shard_id
+          opts[:exclusive_start_shard_id] = last_evaluated_shard_id if last_evaluated_shard_id
 
           resp = @client.describe_stream(opts)
 
           last_evaluated_shard_id = resp.stream_description.last_evaluated_shard_id
+
           shards = resp.stream_description.shards
-
           shards.each do |shard|
-            # If we followed a shard previously, find the next one
-            if @current_shard_id
-              if shard.parent_shard_id == @current_shard_id
-                next_shard = shard
-                break
-              else
-                next
-              end
-            end
-
-            # Shard without an ending sequence number contains the latest records
-            unless shard.sequence_number_range.ending_sequence_number
-              next_shard = shard
-              break
-            end
+            yield shard
           end
 
-          break if next_shard || !last_evaluated_shard_id
+          break if shards.length < limit
         end
-
-        raise "Couldn't find next shard" unless next_shard
-
-        @current_shard_id = next_shard.shard_id
       end
 
-      def get_shard_iterator
+      def get_shard_iterator(shard, type)
         # https://docs.aws.amazon.com/sdk-for-ruby/v3/api/Aws/DynamoDBStreams/Client.html#get_shard_iterator-instance_method
-        resp = @client.get_shard_iterator({
-          shard_id: @current_shard_id,
-          shard_iterator_type: "LATEST",
+        opts = {
+          shard_id: shard.shard_id,
+          shard_iterator_type: type,
           stream_arn: @stream_arn,
-        })
+        }
 
-        @shard_iterator = resp.shard_iterator
+        opts[:sequence_number] = shard.sequence_number_range.starting_sequence_number if type == "AT_SEQUENCE_NUMBER"
+
+        resp = @client.get_shard_iterator(opts)
+
+        resp.shard_iterator
       end
     end
   end
