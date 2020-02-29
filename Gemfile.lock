@@ -33,7 +33,7 @@ GEM
       ast (~> 2.4.0)
     psych (3.1.0)
     rainbow (3.0.0)
-    rake (10.5.0)
+    rake (13.0.1)
     rspec (3.8.0)
       rspec-core (~> 3.8.0)
       rspec-expectations (~> 3.8.0)
@@ -72,7 +72,7 @@ DEPENDENCIES
   aws-sdk-dynamodb (~> 1.31)
   bundler (~> 2.0)
   dynamodb-stream-enumerator!
-  rake (~> 10.0)
+  rake (~> 13.0)
   rspec (~> 3.0)
   simplecov (~> 0.16.1)
   standard (~> 0.0.40)
